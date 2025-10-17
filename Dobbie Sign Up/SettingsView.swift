@@ -19,6 +19,11 @@ struct SettingsView: View {
     @State private var shareCode: String = ""
     @State private var shareCodeExpiresAt: String = ""  // ISO from server
 
+    // Family members
+    @State private var members: [SupabaseManager.FamilyMemberWithUser] = []
+    @State private var currentUserId: String?
+    @State private var isCreator: Bool = false
+
     // UX
     @State private var isLoading = false
     @State private var error: String?
@@ -49,8 +54,59 @@ struct SettingsView: View {
                     }
                 }
 
-                // MARK: Collaborators
-                Section("Collaborators") {
+                // MARK: Family Members
+                Section("Family Members") {
+                    if members.isEmpty {
+                        Text("No members yet").foregroundStyle(.secondary)
+                    } else {
+                        ForEach(members) { member in
+                            HStack {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(member.displayName)
+                                        .font(.body)
+                                    Text(member.displayEmail)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                
+                                Spacer()
+                                
+                                // Show "You" badge for current user
+                                if member.user_id == currentUserId {
+                                    Text("You")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Color(.systemGray5))
+                                        .clipShape(Capsule())
+                                }
+                                // Show remove button only for creators (and not for themselves)
+                                else if isCreator {
+                                    Button(role: .destructive) {
+                                        Task { await removeMember(member) }
+                                    } label: {
+                                        Image(systemName: "person.fill.xmark")
+                                            .foregroundStyle(.red)
+                                    }
+                                    .buttonStyle(.borderless)
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Leave family button (if not creator)
+                    if !isCreator && selectedFamilyId != nil {
+                        Button(role: .destructive) {
+                            Task { await leaveFamilyAction() }
+                        } label: {
+                            Label("Leave Family", systemImage: "rectangle.portrait.and.arrow.right")
+                        }
+                    }
+                }
+                
+                // MARK: Invitations
+                Section("Invitations") {
                     // A) Invite link (kept)
                     Button {
                         Task { await createAndShareInvite() }
@@ -66,7 +122,10 @@ struct SettingsView: View {
                         Label("Generate share code", systemImage: "number.circle")
                     }
                     .disabled(selectedFamilyId == nil)
-
+                }
+                
+                // MARK: Pending Invites
+                Section("Pending Invites") {
                     if pending.isEmpty {
                         Text("No pending invites").foregroundStyle(.secondary)
                     } else {
@@ -174,6 +233,9 @@ struct SettingsView: View {
         isLoading = true
         defer { isLoading = false }
         do {
+            // Get current user ID
+            currentUserId = try await SupabaseManager.shared.currentUserIdString()
+            
             families = try await SupabaseManager.shared.myFamilies()
             if selectedFamilyId == nil {
                 selectedFamilyId = SupabaseManager.shared.getActiveFamilyId() ?? families.first?.id
@@ -187,9 +249,15 @@ struct SettingsView: View {
     // MARK: - Helpers
     @MainActor
     private func setActiveFamilyAndReload() async {
-        guard let fid = selectedFamilyId else { pending = []; return }
+        guard let fid = selectedFamilyId else { 
+            pending = []
+            members = []
+            return 
+        }
         SupabaseManager.shared.setActiveFamilyId(fid)
         await loadPending()
+        await loadMembers()
+        await checkIfCreator()
     }
 
     private func loadPending() async {
@@ -198,6 +266,24 @@ struct SettingsView: View {
             pending = try await SupabaseManager.shared.pendingFamilyInvites(familyId: fid)
         } catch {
             self.error = error.localizedDescription
+        }
+    }
+    
+    private func loadMembers() async {
+        guard let fid = selectedFamilyId else { members = []; return }
+        do {
+            members = try await SupabaseManager.shared.fetchFamilyMembers(familyId: fid)
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+    
+    private func checkIfCreator() async {
+        guard let fid = selectedFamilyId else { isCreator = false; return }
+        do {
+            isCreator = try await SupabaseManager.shared.isCreatorOfFamily(familyId: fid)
+        } catch {
+            isCreator = false
         }
     }
 
@@ -277,6 +363,33 @@ struct SettingsView: View {
             return df.string(from: d)
         }
         return isoString
+    }
+    
+    // MARK: - Member Management Actions
+    private func removeMember(_ member: SupabaseManager.FamilyMemberWithUser) async {
+        do {
+            try await SupabaseManager.shared.removeFamilyMember(memberId: member.id)
+            await loadMembers()
+            haptic(.success)
+        } catch {
+            self.error = error.localizedDescription
+            haptic(.error)
+        }
+    }
+    
+    private func leaveFamilyAction() async {
+        guard let fid = selectedFamilyId else { return }
+        do {
+            try await SupabaseManager.shared.leaveFamily(familyId: fid)
+            // Reload families
+            families = try await SupabaseManager.shared.myFamilies()
+            selectedFamilyId = families.first?.id
+            await setActiveFamilyAndReload()
+            haptic(.success)
+        } catch {
+            self.error = error.localizedDescription
+            haptic(.error)
+        }
     }
 }
 

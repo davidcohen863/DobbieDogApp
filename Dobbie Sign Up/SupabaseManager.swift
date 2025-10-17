@@ -21,14 +21,17 @@ private let isoZ: ISO8601DateFormatter = {
 private func isoString(_ date: Date) -> String { isoZ.string(from: date) }
 
 // ===============================================================
-// MARK: - Realtime
+// MARK: - Realtime (Multi-User Sync)
 // ===============================================================
 
 extension SupabaseManager {
     private struct RealtimeStore {
         static var activityChannel: RealtimeChannelV2?
+        static var familyChannel: RealtimeChannelV2?
         static var activeDogId: String?
+        static var activeFamilyId: String?
         static var subscriptions: [RealtimeSubscription] = [] // keep callbacks alive
+        static var familySubscriptions: [RealtimeSubscription] = []
     }
 
     /// Listen to INSERT/UPDATE/DELETE on `activity_logs` for a dog.
@@ -96,6 +99,147 @@ extension SupabaseManager {
         RealtimeStore.activeDogId = nil
         RealtimeStore.subscriptions.removeAll()
         print("🛑 Realtime v2 unsubscribed")
+    }
+    
+    // MARK: - Family-wide Realtime Sync
+    
+    /// Subscribe to all family-related changes (dogs, reminders, members)
+    /// This enables real-time collaboration for all team members
+    @MainActor
+    func startFamilyRealtime(
+        familyId: String,
+        onDogsChange: @escaping () -> Void,
+        onRemindersChange: @escaping () -> Void,
+        onMembersChange: @escaping () -> Void
+    ) async {
+        // Avoid duplicate subscribe for the same family
+        if RealtimeStore.activeFamilyId == familyId, RealtimeStore.familyChannel != nil {
+            return
+        }
+        
+        // Tear down any existing channel
+        if let ch = RealtimeStore.familyChannel {
+            await ch.unsubscribe()
+        }
+        RealtimeStore.familyChannel = nil
+        RealtimeStore.activeFamilyId = nil
+        RealtimeStore.familySubscriptions.removeAll()
+        
+        // Create v2 channel for family-wide changes
+        let channel = client.realtimeV2.channel("realtime:family:\(familyId)")
+        
+        var subs: [RealtimeSubscription] = []
+        
+        // ---- DOGS table changes ----
+        subs.append(channel.onPostgresChange(
+            InsertAction.self,
+            schema: "public",
+            table: "dogs",
+            filter: "family_id=eq.\(familyId)"
+        ) { _ in onDogsChange() })
+        
+        subs.append(channel.onPostgresChange(
+            UpdateAction.self,
+            schema: "public",
+            table: "dogs",
+            filter: "family_id=eq.\(familyId)"
+        ) { _ in onDogsChange() })
+        
+        subs.append(channel.onPostgresChange(
+            DeleteAction.self,
+            schema: "public",
+            table: "dogs",
+            filter: "family_id=eq.\(familyId)"
+        ) { _ in onDogsChange() })
+        
+        // ---- REMINDERS table changes (filtered by dog's family) ----
+        // Note: Since reminders don't have family_id directly, we'll listen to all
+        // and let RLS handle the filtering. Alternatively, use a database function.
+        subs.append(channel.onPostgresChange(
+            InsertAction.self,
+            schema: "public",
+            table: "reminders"
+        ) { _ in onRemindersChange() })
+        
+        subs.append(channel.onPostgresChange(
+            UpdateAction.self,
+            schema: "public",
+            table: "reminders"
+        ) { _ in onRemindersChange() })
+        
+        subs.append(channel.onPostgresChange(
+            DeleteAction.self,
+            schema: "public",
+            table: "reminders"
+        ) { _ in onRemindersChange() })
+        
+        // ---- REMINDER_OCCURRENCES table changes ----
+        subs.append(channel.onPostgresChange(
+            UpdateAction.self,
+            schema: "public",
+            table: "reminder_occurrences"
+        ) { _ in onRemindersChange() })
+        
+        // ---- FAMILY_MEMBERS table changes ----
+        subs.append(channel.onPostgresChange(
+            InsertAction.self,
+            schema: "public",
+            table: "family_members",
+            filter: "family_id=eq.\(familyId)"
+        ) { _ in onMembersChange() })
+        
+        subs.append(channel.onPostgresChange(
+            DeleteAction.self,
+            schema: "public",
+            table: "family_members",
+            filter: "family_id=eq.\(familyId)"
+        ) { _ in onMembersChange() })
+        
+        // Keep subscriptions alive
+        RealtimeStore.familySubscriptions = subs
+        
+        // ---- THEN SUBSCRIBE ----
+        try? await channel.subscribeWithError()
+        RealtimeStore.familyChannel = channel
+        RealtimeStore.activeFamilyId = familyId
+        
+        print("✅ Family realtime v2 subscribed for family \(familyId)")
+    }
+    
+    @MainActor
+    func stopFamilyRealtime() async {
+        if let ch = RealtimeStore.familyChannel {
+            await ch.unsubscribe()
+        }
+        RealtimeStore.familyChannel = nil
+        RealtimeStore.activeFamilyId = nil
+        RealtimeStore.familySubscriptions.removeAll()
+        print("🛑 Family realtime v2 unsubscribed")
+    }
+    
+    /// Convenience method to start both activity logs and family-wide realtime
+    @MainActor
+    func startAllRealtime(
+        dogId: String,
+        familyId: String,
+        onActivityChange: @escaping () -> Void,
+        onDogsChange: @escaping () -> Void,
+        onRemindersChange: @escaping () -> Void,
+        onMembersChange: @escaping () -> Void
+    ) async {
+        await startActivityLogsRealtime(dogId: dogId, onChange: onActivityChange)
+        await startFamilyRealtime(
+            familyId: familyId,
+            onDogsChange: onDogsChange,
+            onRemindersChange: onRemindersChange,
+            onMembersChange: onMembersChange
+        )
+    }
+    
+    @MainActor
+    func stopAllRealtime() async {
+        await stopActivityLogsRealtime()
+        await stopFamilyRealtime()
     }
 }
 
@@ -1296,7 +1440,27 @@ extension SupabaseManager {
         let name: String
     }
 
-    
+    // Family member model with user info
+    struct FamilyMemberWithUser: Identifiable, Decodable {
+        let id: String
+        let family_id: String
+        let user_id: String
+        let joined_at: String
+        
+        // Embedded user info from auth.users via a join
+        struct UserInfo: Decodable {
+            let email: String?
+        }
+        let users: UserInfo?
+        
+        var displayName: String {
+            users?.email?.split(separator: "@").first.map(String.init) ?? "Unknown"
+        }
+        
+        var displayEmail: String {
+            users?.email ?? "No email"
+        }
+    }
    
 
     // MARK: - Helpers
@@ -1308,6 +1472,71 @@ extension SupabaseManager {
                           userInfo: [NSLocalizedDescriptionKey: "Not signed in"])
         }
         return session.user.id.uuidString
+    }
+    
+    // MARK: - Family Member Management
+    
+    /// Fetch all members of a family with their user info
+    func fetchFamilyMembers(familyId: String) async throws -> [FamilyMemberWithUser] {
+        // Query with a join to auth.users to get email
+        // Note: This requires your Supabase instance to allow querying auth.users
+        // If not available, you'll need to create a public.users table
+        let members: [FamilyMemberWithUser] = try await client
+            .from("family_members")
+            .select("id, family_id, user_id, joined_at, users:user_id(email)")
+            .eq("family_id", value: familyId)
+            .order("joined_at", ascending: true)
+            .execute()
+            .value
+        
+        return members
+    }
+    
+    /// Remove a member from a family (only family creator can do this via RLS)
+    @MainActor
+    func removeFamilyMember(memberId: String) async throws {
+        try await client
+            .from("family_members")
+            .delete()
+            .eq("id", value: memberId)
+            .execute()
+    }
+    
+    /// Leave a family (user removes themselves)
+    @MainActor
+    func leaveFamily(familyId: String) async throws {
+        let userId = try await currentUserIdString()
+        
+        try await client
+            .from("family_members")
+            .delete()
+            .eq("family_id", value: familyId)
+            .eq("user_id", value: userId)
+            .execute()
+        
+        // If this was the active family, clear it
+        if getActiveFamilyId() == familyId {
+            setActiveFamilyId(nil)
+            clearDogCache()
+        }
+    }
+    
+    /// Check if current user is the creator of a family
+    func isCreatorOfFamily(familyId: String) async throws -> Bool {
+        let userId = try await currentUserIdString()
+        
+        struct FamilyCheck: Decodable {
+            let created_by: String
+        }
+        
+        let families: [FamilyCheck] = try await client
+            .from("families")
+            .select("created_by")
+            .eq("id", value: familyId)
+            .execute()
+            .value
+        
+        return families.first?.created_by == userId
     }
 
 
